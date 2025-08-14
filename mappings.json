@@ -1,0 +1,17 @@
+{
+    "team_a": {
+        "os": "os",
+        "cpu": "cpu_model",
+        "memory_gb": "memory_gb"
+    },
+    "team_b": {
+        "os": "OperatingSystem",
+        "cpu": "CPU",
+        "memory_gb": "lambda data: int(data['RAM'].split()[0])"
+    },
+    "team_c": {
+        "os": ["OSName", "osName"],
+        "cpu": "processor",
+        "memory_gb": "lambda data: int(data['mem']) / 1024"
+    }
+}
