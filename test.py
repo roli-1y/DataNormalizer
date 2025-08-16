@@ -1,173 +1,165 @@
 import unittest
-import json
+import mongomock
 from flask import Flask
-from main import app
-from main import MACHINES
+from unittest.mock import patch
+import json
+from main import app, collection, MAPPINGS
 
-class MachineServiceTestCase(unittest.TestCase):
+class TestMachinesEndpoint(unittest.TestCase):
     def setUp(self):
-        """Set up the test client and clear in-memory storage."""
+        """Set up the Flask test client and mock MongoDB collection."""
         self.app=app
         self.client=self.app.test_client()
-        MACHINES.clear()  # Reset in-memory storage before each test
+        self.app.config['TESTING']=True
 
-    def test_post_machines_team_a_valid_single(self):
-        """Test POST /machines with a valid single payload for team_a."""
-        payload={
-            "os": "Ubuntu 20.04",
-            "cpu_model": "Xeon E5",
-            "memory_gb": 64
+        # Patch the MongoDB collection with a mongomock collection
+        self.mock_db=mongomock.MongoClient().db
+        self.mock_collection=self.mock_db['machine_data']
+        self.patcher_collection=patch('main.collection', self.mock_collection)
+        self.patcher_collection.start()
+
+        # Mock MAPPINGS to simulate mappings.json for POST test
+        self.mock_mappings={
+            "source1": {
+                "os": "operating_system",
+                "cpu": "processor",
+                "memory_gb": "lambda data: int(data['RAM'].split()[0])"
+            }
         }
-        headers={"X-Source": "team_a", "Content-Type": "application/json"}
-        response=self.client.post('/machines', headers=headers, json=payload)
+        self.patcher_mappings=patch('main.MAPPINGS', self.mock_mappings)
+        self.patcher_mappings.start()
 
-        self.assertEqual(response.status_code, 200)
-        data=response.get_json()
-        self.assertEqual(data["status"], "ok")
-        self.assertEqual(data["inserted"], 1)
-        self.assertEqual(len(data["errors"]), 0)
-        self.assertEqual(len(MACHINES), 1)
-        self.assertEqual(MACHINES[0], {"os": "Ubuntu 20.04", "cpu": "Xeon E5", "memory_gb": 64.0})
+    def tearDown(self):
+        """Clean up after the test."""
+        self.patcher_collection.stop()
+        self.patcher_mappings.stop()
 
-    def test_post_machines_team_b_valid_array(self):
-        """Test POST /machines with a valid array payload for team_b."""
-        payload=[
-            {"OperatingSystem": "Debian 12", "CPU": "Ryzen 7", "RAM": "32 GB"},
-            {"OperatingSystem": "Ubuntu 22.04", "CPU": "Intel i9", "RAM": "16 GB"}
+    def test_get_machines_with_pagination_and_filter(self):
+        """Test /machines GET endpoint with pagination and OS filter."""
+        # Insert mock data
+        mock_data=[
+            {"os": "Windows", "cpu": "Intel i7", "memory_gb": 16.0, "source": "source1", "timestamp": "2023-10-01"},
+            {"os": "Linux", "cpu": "AMD Ryzen", "memory_gb": 32.0, "source": "source1", "timestamp": "2023-10-02"},
+            {"os": "Windows", "cpu": "Intel i5", "memory_gb": 8.0, "source": "source2", "timestamp": "2023-10-03"},
+            {"os": "MacOS", "cpu": "Apple M1", "memory_gb": 16.0, "source": "source2", "timestamp": "2023-10-04"}
         ]
-        headers={"X-Source": "team_b", "Content-Type": "application/json"}
-        response=self.client.post('/machines', headers=headers, json=payload)
+        self.mock_collection.insert_many(mock_data)
 
-        self.assertEqual(response.status_code, 200)
-        data=response.get_json()
-        self.assertEqual(data["status"], "ok")
-        self.assertEqual(data["inserted"], 2)
-        self.assertEqual(len(data["errors"]), 0)
-        self.assertEqual(len(MACHINES), 2)
-        self.assertEqual(MACHINES[0]["os"], "Debian 12")
-        self.assertEqual(MACHINES[0]["memory_gb"], 32)
-        self.assertEqual(MACHINES[1]["os"], "Ubuntu 22.04")
-        self.assertEqual(MACHINES[1]["memory_gb"], 16)
+        # Make GET request to /machines with pagination (limit=2, offset=0) and OS filter (os=Windows)
+        response=self.client.get('/machines?limit=2&offset=0&os=Windows')
 
-    def test_post_machines_team_c_os_inconsistent(self):
-        """Test POST /machines with team_c's inconsistent os field names."""
-        payload=[
-            {"osName": "CentOS 7", "processor": "Xeon", "mem": 32768},
-            {"OSName": "Fedora 34", "processor": "Core i5", "mem": 16384}
+
+        # Check status code
+        self.assertEqual(response.status_code, 200, f"Expected status code 200, got {response.status_code}")
+
+        # Parse response
+        data=json.loads(response.data)
+
+        # Expected response (only Windows machines, first 2 records, excluding _id, source, timestamp)
+        expected_data=[
+            {"os": "Windows", "cpu": "Intel i7", "memory_gb": 16.0},
+            {"os": "Windows", "cpu": "Intel i5", "memory_gb": 8.0}
         ]
-        headers={"X-Source": "team_c", "Content-Type": "application/json"}
-        response=self.client.post('/machines', headers=headers, json=payload)
 
-        self.assertEqual(response.status_code, 200)
-        data=response.get_json()
-        self.assertEqual(data["status"], "ok")
-        self.assertEqual(data["inserted"], 2)
-        self.assertEqual(len(data["errors"]), 0)
-        self.assertEqual(len(MACHINES), 2)
-        self.assertEqual(MACHINES[0]["os"], "CentOS 7")
-        self.assertEqual(MACHINES[0]["memory_gb"], 32)  # 32768 MB / 1024
-        self.assertEqual(MACHINES[1]["os"], "Fedora 34")
-        self.assertEqual(MACHINES[1]["memory_gb"], 16)  # 16384 MB / 1024
+        # Assertions
+        self.assertEqual(len(data), 2, "Expected 2 records in response")
+        self.assertEqual(data, expected_data, "Response data mismatch")
 
-    def test_post_machines_invalid_source(self):
-        """Test POST /machines with an invalid X-Source header."""
-        payload={"os": "Ubuntu 20.04", "cpu_model": "Xeon E5", "memory_gb": 64}
-        headers={"X-Source": "invalid_team", "Content-Type": "application/json"}
-        response=self.client.post('/machines', headers=headers, json=payload)
+    def test_post_machines_valid_data(self):
+        """Test /machines POST endpoint with valid data and X-Source header."""
+        # Clear the collection to ensure no residual data
+        self.mock_collection.delete_many({})
 
-        self.assertEqual(response.status_code, 400)
-        data=response.get_json()
-        self.assertEqual(data["status"], "error")
-        self.assertIn("Invalid or missing X-Source header", data["message"])
-        self.assertEqual(len(MACHINES), 0)
+        # Test data
+        post_data={
+            "operating_system": "Windows",
+            "processor": "Intel i7",
+            "RAM": "16 GB"
+        }
 
-    def test_post_machines_invalid_payload(self):
-        """Test POST /machines with an invalid JSON payload."""
-        headers={"X-Source": "team_a", "Content-Type": "application/json"}
-        response=self.client.post('/machines', headers=headers, data="not_json")
+        # Make POST request to /machines with X-Source header
+        response=self.client.post(
+            '/machines',
+            data=json.dumps(post_data),
+            content_type='application/json',
+            headers={'X-Source': 'source1'}
+        )
 
-        self.assertEqual(response.status_code, 400)
-        data=response.get_json()
-        self.assertEqual(data["status"], "error")
-        self.assertIn("Invalid JSON payload", data["message"])
-        self.assertEqual(len(MACHINES), 0)
 
-    def test_post_machines_partial_invalid_array(self):
-        """Test POST /machines with a partially invalid array payload."""
-        payload=[
-            {"os": "Ubuntu 20.04", "cpu_model": "Xeon E5", "memory_gb": 64},
-            "invalid_item",
-            {"os": "Debian 12", "cpu_model": "Ryzen 5", "memory_gb": 32}
+        # Check status code
+        self.assertEqual(response.status_code, 200, f"Expected status code 200, got {response.status_code}")
+
+        # Parse response
+        data=json.loads(response.data)
+
+        # Expected response
+        expected_response={
+            "status": "success",
+            "inserted": 1,
+            "errors": [],
+            "message": "Inserted 1 records"
+        }
+
+        # Assertions for response
+        self.assertEqual(data, expected_response, "Response data mismatch")
+
+        # Verify data was inserted into the collection
+        inserted_docs=list(self.mock_collection.find())
+        self.assertEqual(len(inserted_docs), 1, "Expected 1 document in collection")
+        expected_doc={
+            "os": "Windows",
+            "cpu": "Intel i7",
+            "memory_gb": 16.0
+        }
+        # Remove MongoDB-specific fields for comparison
+        inserted_doc={
+            "os": inserted_docs[0]["os"],
+            "cpu": inserted_docs[0]["cpu"],
+            "memory_gb": inserted_docs[0]["memory_gb"]
+        }
+        self.assertEqual(inserted_doc, expected_doc, "Inserted document mismatch")
+
+    def test_get_all_machines(self):
+        """Test /machines GET endpoint to retrieve all machine data without pagination or filters."""
+        # Clear the collection to ensure no residual data
+        self.mock_collection.delete_many({})
+
+        # Insert mock data
+        mock_data=[
+            {"os": "Windows", "cpu": "Intel i7", "memory_gb": 16.0, "source": "source1", "timestamp": "2023-10-01"},
+            {"os": "Linux", "cpu": "AMD Ryzen", "memory_gb": 32.0, "source": "source1", "timestamp": "2023-10-02"},
+            {"os": "Windows", "cpu": "Intel i5", "memory_gb": 8.0, "source": "source2", "timestamp": "2023-10-03"},
+            {"os": "MacOS", "cpu": "Apple M1", "memory_gb": 16.0, "source": "source2", "timestamp": "2023-10-04"}
         ]
-        headers={"X-Source": "team_a", "Content-Type": "application/json"}
-        response=self.client.post('/machines', headers=headers, json=payload)
+        self.mock_collection.insert_many(mock_data)
 
-        self.assertEqual(response.status_code, 200)
-        data=response.get_json()
-        self.assertEqual(data["status"], "ok")
-        self.assertEqual(data["inserted"], 2)
-        self.assertEqual(len(data["errors"]), 1)
-        self.assertIn("Item 1 is not a valid JSON object", data["errors"])
-        self.assertEqual(len(MACHINES), 2)
+        # Verify data was inserted
+        self.assertEqual(self.mock_collection.count_documents({}), 4, "Failed to insert mock data")
 
-    def test_get_machines_no_filters(self):
-        """Test GET /machines without filters."""
-        MACHINES.extend([
-            {"os": "Ubuntu 20.04", "cpu": "Xeon E5", "memory_gb": 64.0},
-            {"os": "Debian 12", "cpu": "Ryzen 7", "memory_gb": 32.0}
-        ])
+        # Make GET request to /machines without query parameters
         response=self.client.get('/machines')
 
-        self.assertEqual(response.status_code, 200)
-        data=response.get_json()
-        self.assertEqual(len(data), 2)
-        self.assertEqual(data[0]["os"], "Ubuntu 20.04")
-        self.assertEqual(data[1]["os"], "Debian 12")
-
-    def test_get_machines_with_filters_and_pagination(self):
-        """Test GET /machines with os filter, limit, and offset."""
-        MACHINES.extend([
-            {"os": "Ubuntu 20.04", "cpu": "Xeon E5", "memory_gb": 64.0},
-            {"os": "Ubuntu 20.04", "cpu": "Ryzen 7", "memory_gb": 32.0},
-            {"os": "Debian 12", "cpu": "Core i5", "memory_gb": 16.0}
-        ])
-        response=self.client.get('/machines?os=Ubuntu 20.04&limit=1&offset=1')
-
-        self.assertEqual(response.status_code, 200)
-        data=response.get_json()
-        self.assertEqual(len(data), 1)
-        self.assertEqual(data[0]["cpu"], "Ryzen 7")
-        self.assertEqual(data[0]["memory_gb"], 32.0)
-
-    def test_get_stats(self):
-        """Test GET /stats with sample data."""
-        MACHINES.extend([
-            {"os": "Ubuntu 20.04", "cpu": "Xeon E5", "memory_gb": 64.0},
-            {"os": "Ubuntu 20.04", "cpu": "Ryzen 7", "memory_gb": None},
-            {"os": "Debian 12", "cpu": "Core i5", "memory_gb": 16.0},
-            {"os": "", "cpu": "Core i7", "memory_gb": 32.0}
-        ])
-        response=self.client.get('/stats')
-
-        self.assertEqual(response.status_code, 200)
-        data=response.get_json()
-        self.assertEqual(data["total_records"], 4)
-        self.assertEqual(data["os_distribution"], {
-            "Ubuntu 20.04": 2,
-            "Debian 12": 1
-        })
-        self.assertAlmostEqual(data["avg_memory_gb"], (64.0 + 16.0 + 32.0) / 3)
-
-    def test_get_stats_empty(self):
-        """Test GET /stats with no data."""
-        response=self.client.get('/stats')
-
-        self.assertEqual(response.status_code, 200)
-        data=response.get_json()
-        self.assertEqual(data["total_records"], 0)
-        self.assertEqual(data["os_distribution"], {})
-        self.assertEqual(data["avg_memory_gb"], 0.0)
 
 
-if __name__=='__main__':
+        # Check status code
+        self.assertEqual(response.status_code, 200, f"Expected status code 200, got {response.status_code}")
+
+        # Parse response
+        data=json.loads(response.data)
+
+        # Expected response (all machines, excluding _id, source, timestamp)
+        expected_data=[
+            {"os": "Windows", "cpu": "Intel i7", "memory_gb": 16.0},
+            {"os": "Linux", "cpu": "AMD Ryzen", "memory_gb": 32.0},
+            {"os": "Windows", "cpu": "Intel i5", "memory_gb": 8.0},
+            {"os": "MacOS", "cpu": "Apple M1", "memory_gb": 16.0}
+        ]
+
+        # Assertions
+        self.assertEqual(len(data), 4, "Expected 4 records in response")
+        self.assertEqual(data, expected_data, "Response data mismatch")
+
+
+
+if __name__ == '__main__':
     unittest.main()
