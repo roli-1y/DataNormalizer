@@ -1,16 +1,49 @@
 import json
 import logging
-from flask import Flask, request, jsonify
+from datetime import datetime
 from statistics import mean
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from pymongo import MongoClient
+from bson import ObjectId
+from bson.json_util import dumps
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger=logging.getLogger(__name__)
 
 app=Flask(__name__)
+CORS(app, resources={
+    r"/stats": {"origins": "http://localhost:5173"},
+    r"/machines": {"origins": "http://localhost:5173"}
+})
+
+# MongoDB Configuration
+MONGO_URI="mongodb://localhost:27017/"
+DB_NAME="machines"
+COLLECTION_NAME="machine_data"
+
+# Connect to MongoDB
+try:
+    client=MongoClient(MONGO_URI)
+    db=client[DB_NAME]
+    collection=db[COLLECTION_NAME]
+    logger.info(f"Connected to MongoDB: {DB_NAME}.{COLLECTION_NAME}")
+
+    # Create indexes for better performance
+    collection.create_index([("os", 1)])
+    collection.create_index([("cpu", 1)])
+    collection.create_index([("timestamp", -1)])
+except Exception as e:
+    logger.error(f"Failed to connect to MongoDB: {str(e)}")
+    raise
+
+# Configuration
 MAPPINGS_FILE='mappings.json'
-MACHINES=[]  # In-memory storage
-MAX_LIMIT=100  # Maximum pagination limit
+MAX_LIMIT=100  # Maximum records per page
 
 # Load mappings from JSON file
 try:
@@ -23,42 +56,15 @@ except json.JSONDecodeError:
     logger.error(f"Invalid JSON in {MAPPINGS_FILE}. Starting with empty mappings.")
     MAPPINGS={}
 
-# Sample data to populate on startup
-SAMPLE_DATA={
-    "team_a": [
-        {"os": "Ubuntu 20.04", "cpu_model": "Xeon E5", "memory_gb": 64},
-        {"os": "Ubuntu 22.04", "cpu_model": "Xeon Gold", "memory_gb": "128"},
-    ],
-
-    "team_b": {
-        "OperatingSystem": "Debian 12",
-        "CPU": "Intel i7",
-        "RAM": "16 GB"
-    },
-    "team_c": {
-        "OSName": "Windows Server 2022",
-        "processor": ["Xeon Platinum", "Xeon Platinum"],
-        "mem": 262144
-    }
-}
-
-# Add test entries (test1 to test50) to team_a using a loop
-for i in range(1, 50):
-    SAMPLE_DATA["team_a"].append({
-        "os": "Ubuntu 20.04",
-        "cpu_model": f"Xeon E5 test{i}",
-        "memory_gb": 64
-    })
-
-# Helper to safely evaluate lambda expressions for memory conversion
+# Helper Functions
 def safe_lambda(data, lambda_str):
     """Safely evaluate lambda expressions for memory conversion."""
-    if lambda_str=="lambda data: int(data['RAM'].split()[0])":
+    if lambda_str == "lambda data: int(data['RAM'].split()[0])":
         try:
             return int(data['RAM'].split()[0])
         except (KeyError, IndexError, ValueError) as e:
             raise ValueError(f"Failed to parse RAM: {str(e)}")
-    elif lambda_str=="lambda data: int(data['mem']) / 1024":
+    elif lambda_str == "lambda data: int(data['mem']) / 1024":
         try:
             return int(data['mem']) / 1024
         except (KeyError, ValueError) as e:
@@ -66,13 +72,16 @@ def safe_lambda(data, lambda_str):
     else:
         raise ValueError(f"Unsupported lambda expression: {lambda_str}")
 
-# Helper to get field value based on mapping
 def get_field(data, mapping):
+    """Get field value based on mapping configuration."""
+    if not mapping:
+        return None
+
     if isinstance(mapping, list):
-        # Try case-insensitive matching
+        # Try case-insensitive matching for list of possible field names
         for key in mapping:
             for k in data:
-                if k.lower()==key.lower():
+                if k.lower() == key.lower():
                     return data[k]
         return None
     elif isinstance(mapping, str):
@@ -84,191 +93,213 @@ def get_field(data, mapping):
         else:
             # Case-insensitive key lookup
             for k in data:
-                if k.lower()==mapping.lower():
+                if k.lower() == mapping.lower():
                     return data[k]
             return data.get(mapping)
     else:
         raise ValueError("Invalid mapping type")
 
-# Insert normalized record into in-memory storage
 def insert_record(record):
-    MACHINES.append(record)
-    logger.info(f"Inserted record: {record}")
+    """Insert a record into MongoDB."""
+    try:
+        result=collection.insert_one(record)
+        logger.info(f"Inserted record with ID: {result.inserted_id}")
+        return str(result.inserted_id)
+    except Exception as e:
+        logger.error(f"Failed to insert record: {str(e)}")
+        raise
 
-# Function to populate sample data
-def populate_sample_data():
-    """Populate MACHINES with sample data on startup."""
-    for source, data in SAMPLE_DATA.items():
-        if source not in MAPPINGS:
-            logger.error(f"Skipping sample data for {source}: not in mappings")
-            continue
-
-        items=[data] if isinstance(data, dict) else data
-        inserted=0
-        errors=[]
-
-        for i, item in enumerate(items):
-            if not isinstance(item, dict):
-                errors.append(f"Sample item {i} for {source} is not a valid JSON object")
-                logger.error(f"Sample item {i} for {source} is not a valid JSON object")
-                continue
-
-            try:
-                maps=MAPPINGS[source]
-
-                def extract_field(field_name):
-                    mapping=maps.get(field_name)
-                    if mapping is None:
-                        return "" if field_name!='memory_gb' else None
-
-                    val=get_field(item, mapping)
-
-                    if field_name=='cpu' and isinstance(val, list):
-                        val=', '.join(map(str, val))
-
-                    if field_name=='memory_gb' and val is not None:
-                        try:
-                            val=float(val)
-                        except (ValueError, TypeError):
-                            raise ValueError(f"Invalid memory_gb value for item {i}: {val}")
-
-                    if field_name in ('os', 'cpu') and val is not None and not isinstance(val, str):
-                        raise ValueError(f"Invalid {field_name} type for item {i}: expected string, got {type(val)}")
-
-                    return val
-
-                record={
-                    "os": extract_field("os") or "",
-                    "cpu": extract_field("cpu") or "",
-                    "memory_gb": extract_field("memory_gb")
-                }
-
-                insert_record(record)
-                inserted+=1
-            except Exception as e:
-                error_msg=f"Error processing sample item {i} for {source}: {str(e)}"
-                errors.append(error_msg)
-                logger.error(error_msg)
-
-        logger.info(f"Populated sample data for {source}: inserted {inserted}, errors {errors}")
-
-# Clear in-memory storage and populate sample data on startup
-MACHINES.clear()
-logger.info("Cleared in-memory storage on startup.")
-populate_sample_data()
-
+# API Endpoints
 @app.route('/machines', methods=['POST'])
 def post_machines():
+    """Endpoint to add new machine data."""
     source=request.headers.get('X-Source')
     if not source or source not in MAPPINGS:
-        logger.error(f"Invalid or missing X-Source header: {source}")
-        return jsonify({"status": "error", "message": f"Invalid or missing X-Source header: {source}"}), 400
+        return jsonify({
+            "status": "error",
+            "message": f"Invalid or missing X-Source header. Valid sources: {list(MAPPINGS.keys())}"
+        }), 400
 
     try:
-        data=request.json
-    except:
-        logger.error("Invalid JSON payload received")
+        data=request.get_json()
+        if not data:
+            return jsonify({"status": "error", "message": "No data provided"}), 400
+    except Exception as e:
         return jsonify({"status": "error", "message": "Invalid JSON payload"}), 400
-
-    if not isinstance(data, (dict, list)):
-        logger.error(f"Payload must be a JSON object or array, got: {type(data)}")
-        return jsonify({"status": "error", "message": "Payload must be a JSON object or array"}), 400
 
     items=[data] if isinstance(data, dict) else data
     inserted=0
     errors=[]
 
-    for i, item in enumerate(items):
+    for item in items:
         if not isinstance(item, dict):
-            errors.append(f"Item {i} is not a valid JSON object")
-            logger.error(f"Item {i} is not a valid JSON object")
+            errors.append("Item is not a valid JSON object")
             continue
 
         try:
             maps=MAPPINGS[source]
-
-            def extract_field(field_name):
-                mapping=maps.get(field_name)
-                if mapping is None:
-                    return "" if field_name!='memory_gb' else None
-
-                val=get_field(item, mapping)
-
-                if field_name=='cpu' and isinstance(val, list):
-                    val=', '.join(map(str, val))
-
-                if field_name=='memory_gb' and val is not None:
-                    try:
-                        val=float(val)
-                    except (ValueError, TypeError):
-                        raise ValueError(f"Invalid memory_gb value for item {i}: {val}")
-
-                if field_name in ('os', 'cpu') and val is not None and not isinstance(val, str):
-                    raise ValueError(f"Invalid {field_name} type for item {i}: expected string, got {type(val)}")
-
-                return val
-
             record={
-                "os": extract_field("os") or "",
-                "cpu": extract_field("cpu") or "",
-                "memory_gb": extract_field("memory_gb")
+                "os": get_field(item, maps.get("os")) or "",
+                "cpu": get_field(item, maps.get("cpu")) or "",
+                "memory_gb": get_field(item, maps.get("memory_gb"))
             }
 
-            insert_record(record)
-            inserted+=1
-        except Exception as e:
-            error_msg=f"Error processing item {i}: {str(e)}"
-            errors.append(error_msg)
-            logger.error(error_msg)
+            # Validate required fields
+            if not record['os'] or not record['cpu']:
+                raise ValueError("Missing required fields (os or cpu)")
 
-    response={"status": "ok", "inserted": inserted, "errors": errors}
-    logger.info(f"POST /machines response: {response}")
-    return jsonify(response)
+            # Convert memory to float if present
+            if record['memory_gb'] is not None:
+                try:
+                    record['memory_gb']=float(record['memory_gb'])
+                except ValueError:
+                    raise ValueError("memory_gb must be a number")
+
+            insert_record(record)
+            inserted += 1
+        except Exception as e:
+            errors.append(str(e))
+            logger.error(f"Error processing item: {str(e)}")
+
+    return jsonify({
+        "status": "success",
+        "inserted": inserted,
+        "errors": errors,
+        "message": f"Inserted {inserted} records"
+    })
 
 @app.route('/machines', methods=['GET'])
 def get_machines():
-    os_filter=request.args.get('os')
-    cpu_filter=request.args.get('cpu')
-    limit=request.args.get('limit', type=int)
-    offset=request.args.get('offset', type=int, default=0)
+    """Endpoint to retrieve machine data with pagination and filtering."""
+    try:
+        # Pagination parameters - support both limit/offset and page/per_page styles
+        limit=request.args.get('limit', default=10, type=int)
+        offset=request.args.get('offset', default=0, type=int)
 
-    if limit is not None and limit>MAX_LIMIT:
-        logger.warning(f"Requested limit {limit} exceeds max {MAX_LIMIT}, using max.")
-        limit=MAX_LIMIT
+        # Convert to page/per_page style if needed
+        if limit and offset:
+            per_page=min(limit, MAX_LIMIT)
+            page=(offset // per_page) + 1
+        else:
+            # Fallback to page/per_page if limit/offset not provided
+            page=request.args.get('page', 1, type=int)
+            per_page=min(request.args.get('per_page', 10, type=int), MAX_LIMIT)
 
-    filtered=MACHINES
+        # Filter parameters
+        os_filter=request.args.get('os')
+        cpu_filter=request.args.get('cpu')
 
-    if os_filter:
-        filtered=[r for r in filtered if r['os']==os_filter]
-    if cpu_filter:
-        filtered=[r for r in filtered if r['cpu']==cpu_filter]
+        # Build query
+        query={}
+        if os_filter:
+            query['os']=os_filter
+        if cpu_filter:
+            query['cpu']=cpu_filter
 
-    if limit is not None:
-        filtered=filtered[offset:offset + limit]
+        # Get total count
+        total=collection.count_documents(query)
 
-    logger.info(f"GET /machines: Returned {len(filtered)} records")
-    return jsonify(filtered)
+        # Get paginated results - exclude _id, source, and timestamp
+        projection={
+            '_id': 0,
+            'source': 0,
+            'timestamp': 0
+        }
+        cursor=collection.find(query, projection).skip(offset).limit(limit)
+        results=list(cursor)
+
+        return jsonify(results)
+    except Exception as e:
+        logger.error(f"Database query failed: {str(e)}")
+        return jsonify({
+            "status": "error",
+            "message": "Failed to retrieve data"
+        }), 500
 
 @app.route('/stats', methods=['GET'])
 def get_stats():
-    total_records=len(MACHINES)
+    """Endpoint to get statistics about machine data."""
+    try:
+        # Total records
+        total=collection.count_documents({})
 
-    os_distribution={}
-    for record in MACHINES:
-        os=record['os']
-        if os:  # Exclude empty os
-            os_distribution[os]=os_distribution.get(os, 0) + 1
+        # OS distribution (handle null/missing values)
+        os_distribution=list(collection.aggregate([
+            {"$match": {"os": {"$exists": True, "$ne": None}}},
+            {"$group": {"_id": "$os", "count": {"$sum": 1}}}
+        ]))
 
-    memory_values=[r['memory_gb'] for r in MACHINES if r['memory_gb'] is not None]
-    avg_memory_gb=float(mean(memory_values)) if memory_values else 0.0
+        # CPU distribution (handle null/missing values)
+        cpu_distribution=list(collection.aggregate([
+            {"$match": {"cpu": {"$exists": True, "$ne": None}}},
+            {"$group": {"_id": "$cpu", "count": {"$sum": 1}}}
+        ]))
 
-    response={
-        "total_records": total_records,
-        "os_distribution": os_distribution,
-        "avg_memory_gb": avg_memory_gb
-    }
-    logger.info(f"GET /stats: {response}")
-    return jsonify(response)
+        # Memory statistics (only for numeric values)
+        memory_stats=list(collection.aggregate([
+            {"$match": {
+                "memory_gb": {
+                    "$exists": True,
+                    "$ne": None,
+                    "$type": ["number", "int", "double", "decimal"]
+                }
+            }},
+            {"$group": {
+                "_id": None,
+                "avg": {"$avg": "$memory_gb"},
+                "min": {"$min": "$memory_gb"},
+                "max": {"$max": "$memory_gb"},
+                "count": {"$sum": 1}
+            }}
+        ]))
 
-if __name__=='__main__':
-    app.run(debug=True, port=5000)
+        # Prepare response
+        response={
+            "total_records": total,
+            "os_distribution": {item["_id"]: item["count"] for item in os_distribution},
+            "cpu_distribution": {item["_id"]: item["count"] for item in cpu_distribution},
+        }
+
+        # Add memory stats if available
+        if memory_stats and memory_stats[0]['count'] > 0:
+            response.update({
+                "memory_stats": {
+                    "average_gb": round(memory_stats[0]['avg'], 2),
+                    "minimum_gb": memory_stats[0]['min'],
+                    "maximum_gb": memory_stats[0]['max'],
+                    "count": memory_stats[0]['count']
+                }
+            })
+        else:
+            response["memory_stats"]={
+                "message": "No valid memory data available",
+                "count": 0
+            }
+
+        return jsonify(response)
+
+    except Exception as e:
+        logger.error(f"Stats calculation failed: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to calculate statistics: {str(e)}"
+        }), 500
+
+@app.route('/machines/sources', methods=['GET'])
+def get_sources():
+    """Endpoint to get list of available data sources."""
+    try:
+        sources=list(collection.distinct("source"))
+        return jsonify({
+            "sources": sources,
+            "mappings": list(MAPPINGS.keys())
+        })
+    except Exception as e:
+        logger.error(f"Failed to get sources: {str(e)}")
+        return jsonify({
+            "status": "error",
+            "message": "Failed to retrieve sources"
+        }), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
