@@ -97,64 +97,6 @@ load_mappings(force=True)
 
 
 # Helper Functions
-def safe_lambda(data, lambda_str):
-    """Safely evaluate lambda expressions for memory conversion with support for multiple formats."""
-    try:
-        if lambda_str == "lambda data: int(data['RAM'].split()[0])":
-            # Try standard RAM format first
-            if 'RAM' in data:
-                if isinstance(data['RAM'], (int, float)):
-                    return float(data['RAM'])
-                # Handle "16 GB", "16GB", "16" formats
-                ram_str = str(data['RAM']).upper().replace('GB', '').strip()
-                return float(ram_str.split()[0])
-
-            # Fallback to other possible field names with case-insensitive search
-            for field in ['memory', 'mem', 'ram', 'Memory', 'memory_gb']:
-                if field.lower() in [k.lower() for k in data.keys()]:
-                    actual_key = next(k for k in data.keys() if k.lower() == field.lower())
-                    if isinstance(data[actual_key], (int, float)):
-                        return float(data[actual_key])
-                    # Handle string formats
-                    mem_str = str(data[actual_key]).upper().replace('GB', '').strip()
-                    return float(mem_str.split()[0])
-
-            raise KeyError("No valid memory field found")
-
-        elif lambda_str == "lambda data: int(data['mem']) / 1024":
-            # Handle memory in KB converting to GB
-            for field in ['mem', 'memory']:
-                if field.lower() in [k.lower() for k in data.keys()]:
-                    actual_key = next(k for k in data.keys() if k.lower() == field.lower())
-                    if isinstance(data[actual_key], (int, float)):
-                        return float(data[actual_key]) / 1024
-                    return float(data[actual_key]) / 1024
-
-            # Fallback to memory_gb if available
-            if 'memory_gb' in data:
-                if isinstance(data['memory_gb'], (int, float)):
-                    return float(data['memory_gb'])
-                return float(data['memory_gb'])
-
-            raise KeyError("No valid memory field found")
-
-        elif lambda_str == "lambda data: int(data['memory_gb'])":
-            # Direct memory_gb field access
-            if 'memory_gb' in data:
-                if isinstance(data['memory_gb'], (int, float)):
-                    return float(data['memory_gb'])
-                return float(data['memory_gb'])
-
-            raise KeyError("No valid memory_gb field found")
-
-        else:
-            raise ValueError(f"Unsupported lambda expression: {lambda_str}")
-
-    except (KeyError, IndexError, ValueError, AttributeError) as e:
-        logger.error(f"Failed to parse memory: {str(e)}, data: {data}")
-        raise ValueError(f"Failed to parse memory: {str(e)}")
-
-
 def get_field(data, mapping):
     """Get field value based on mapping configuration."""
     if not mapping:
@@ -168,17 +110,39 @@ def get_field(data, mapping):
                     return data[k]
         return None
     elif isinstance(mapping, str):
-        if mapping.startswith('lambda '):
-            try:
-                return safe_lambda(data, mapping)
-            except Exception as e:
-                raise ValueError(f"Lambda execution error: {str(e)}")
-        else:
-            # Case-insensitive key lookup
+        # Case-insensitive key lookup
+        for k in data:
+            if k.lower() == mapping.lower():
+                return data[k]
+        return data.get(mapping)
+    elif isinstance(mapping, dict):
+        # Handle dictionary-based mappings with lambda conversion
+        fields = mapping.get("fields", [])
+        conversion_lambda = mapping.get("convert")
+
+        for field in fields:
             for k in data:
-                if k.lower() == mapping.lower():
-                    return data[k]
-            return data.get(mapping)
+                if k.lower() == field.lower():
+                    value = data[k]
+                    try:
+                        if conversion_lambda:
+                            # Execute the lambda function from the mapping
+                            # The lambda should be defined as a string that can be evaluated
+                            # Example: "lambda x: float(x) / 1024"
+                            if isinstance(conversion_lambda, str) and conversion_lambda.startswith("lambda"):
+                                # Create the lambda function
+                                func = eval(conversion_lambda)
+                                return func(value)
+                            else:
+                                # Direct value if no valid lambda
+                                return value
+                        else:
+                            # No conversion specified, return raw value
+                            return value
+                    except (ValueError, TypeError, SyntaxError) as e:
+                        logger.error(f"Failed to convert {field} with lambda {conversion_lambda}: {str(e)}")
+                        raise ValueError(f"Failed to convert {field}: {str(e)}")
+        return None
     else:
         raise ValueError("Invalid mapping type")
 
@@ -393,7 +357,7 @@ def get_stats():
             "total_records": total,
             "os_distribution": {item["_id"]: item["count"] for item in os_distribution},
             "cpu_distribution": {item["_id"]: item["count"] for item in cpu_distribution},
-     
+
         }
 
         # Add memory stats if available

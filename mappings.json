@@ -1,17 +1,26 @@
 {
     "team_a": {
-        "os": ["os","OperatingSystem", "Os"],
-        "cpu": ["CPU", "CpuModel","cpu_model"],
-        "memory_gb": "memory_gb"
+        "os": ["os", "OperatingSystem", "Os"],
+        "cpu": ["CPU", "CpuModel", "cpu_model"],
+        "memory_gb": {
+            "fields": ["memory_gb", "MemoryGB", "memory"],
+            "convert": "lambda x: float(x)"
+        }
     },
     "team_b": {
-        "os": "OperatingSystem",
-        "cpu": "CPU",
-        "memory_gb": "lambda data: int(data['RAM'].split()[0])"
+        "os": ["OperatingSystem", "os"],
+        "cpu": ["CPU", "processor"],
+        "memory_gb": {
+            "fields": ["RAM", "ram", "memory"],
+            "convert": "lambda x: float(str(x).upper().replace('GB', '').strip().split()[0])"
+        }
     },
     "team_c": {
         "os": ["OSName", "osName"],
-        "cpu": ["CPUs","processor"],
-        "memory_gb": "lambda data: int(data['mem']) / 1024"
+        "cpu": ["CPUs", "processor"],
+        "memory_gb": {
+            "fields": ["memory", "mem", "Memory"],
+            "convert": "lambda x: float(x) / 1024"
+        }
     }
 }
