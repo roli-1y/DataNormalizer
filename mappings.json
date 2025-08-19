@@ -11,7 +11,7 @@
     },
     "team_c": {
         "os": ["OSName", "osName"],
-        "cpu": ["CPUs"],
+        "cpu": ["CPUs","processor"],
         "memory_gb": "lambda data: int(data['mem']) / 1024"
     }
 }
